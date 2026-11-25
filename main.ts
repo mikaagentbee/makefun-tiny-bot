@@ -66,7 +66,7 @@ function buyCandidates(state: BarsState): string[] {
     if (lastStop !== undefined && state.seq - lastStop < COOLDOWN_BARS) continue;
     const price = series[series.length - 1];
     const mean = sma(series);
-    if (price * BPS > mean * (BPS - DIP_BPS)) continue;
+    if (price * 10_000 > mean * (10_000 - DIP_BPS)) continue;
     ranked.push({ symbol, ratio: price / mean });
   }
   ranked.sort((a, b) => a.ratio - b.ratio);
@@ -80,9 +80,9 @@ function shouldExit(state: BarsState, symbol: string): boolean {
   if (!series || series.length < LOOKBACK_BARS + 1) return false;
   const price = series[series.length - 1];
   const mean = sma(series);
-  if (price * BPS >= mean * (BPS + EXIT_BPS)) return true;
+  if (price * 10_000 >= mean * (10_000 + EXIT_BPS)) return true;
   const entry = entryClose.get(symbol);
-  if (entry !== undefined && price * BPS < entry * (BPS - STOP_BPS)) return true;
+  if (entry !== undefined && price * 10_000 < entry * (10_000 - STOP_BPS)) return true;
   return false;
 }
 
@@ -138,7 +138,7 @@ await runBars({
       const series = closes.get(symbol)!;
       const price = series[series.length - 1];
       const entry = entryClose.get(symbol);
-      if (entry !== undefined && price * BPS < entry * (BPS - STOP_BPS)) {
+      if (entry !== undefined && price * 10_000 < entry * (10_000 - STOP_BPS)) {
         stopBar.set(symbol, batch.seq);
       }
       entryClose.delete(symbol);
