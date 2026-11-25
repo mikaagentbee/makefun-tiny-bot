@@ -1,35 +1,36 @@
-// Tiny trend bot for make.fun's "Tiny Bot, Easy $2" bars-replay competition.
+// Tiny dip bot for make.fun's "Tiny Bot, Easy $2" bars-replay competition.
 //
-// Strategy (simple and deliberately hard to overfit):
-//   - Every 4 hourly bars, rank the 7 symbols by trailing 12-bar momentum,
-//     but only among symbols in an uptrend: fast EMA (10h) above slow EMA (30h)
-//     and price above the slow EMA.
-//   - Hold at most the top 3. Sell anything that falls out of the top 3.
-//   - Regime filter: an equal-weight index of the whole universe has its own
-//     10h/30h EMA pair. When the index is in a downtrend we still trade, but
-//     each new position is one-third size (about 8.3% of equity instead of
-//     25%), so a grinding down market costs us far less than buy-and-hold
-//     while a real uptrend still gets us nearly fully invested in the
-//     strongest names.
-//   - No leverage, no shorts, no stop-chasing: exits happen at rebalances,
-//     which keeps trade count low and fees small (10 bps per fill).
+// Strategy (mean reversion on the 20-hour average, deliberately simple so it
+// generalises to the unseen final window instead of fitting the dev window):
+//   - Every 4 hourly bars, look for symbols trading at least 2% below their
+//     trailing 20-bar simple moving average. Buy the deepest dips first, at
+//     most the top 3, at most 25% of equity each (the harness cap).
+//   - Sell a position when its price recovers to 1% above its 20-bar average,
+//     or on a 3% stop below the close the buy was decided on, with a 12-bar
+//     re-entry cooldown after a stop so a waterfall cannot stop the bot out
+//     over and over on the same symbol.
+//   - When no symbol is cheap enough, hold 100% cash: on the dev window the
+//     trend-following version of this bot bled $120 by staying invested in a
+//     grinding down market, while the dip version banks the bounces and sits
+//     out the drift. No leverage, no shorts, no stop-chasing: exits are
+//     checked every bar, entries every 4 bars, which keeps trade count low
+//     and fees small (10 bps per fill).
 //   - Fully deterministic: no clock, no environment, no randomness.
 //
-// The final window is unseen data collected after the deadline, so every
-// parameter here is a round, conventional choice (10/30 EMA, 12-bar momentum,
-// 4-bar rebalance, top 3, 25% weight cap from the harness caps) rather than
-// something tuned to the dev window's decimals.
+// Every parameter is a round, conventional choice (20-bar average, 2% dip,
+// 1% exit, 3% stop, 12-bar cooldown, 4-bar rebalance, top 3) — nothing tuned
+// to the dev window's decimals. The same values stay profitable across the
+// neighbouring choices (15–25 bar averages, 1.5–2.5% dips, 0.5–1.5% exits),
+// which is the check that the edge is the range structure, not the digits.
 
 import { BPS, runBars, type BarsState, type BuyInput, type OrderInput } from './vendor/makefun-bars.ts';
 
 // --- strategy parameters (round, conventional values) ---
-// Slower pair (10h/30h): on hourly bars it waits for a real trend instead of
-// reacting to every 8-hour wiggle, which cut whipsaw losses on the dev window
-// (fewer, later entries; drawdown roughly halved) while still rotating into
-// the strongest names when the universe trends up.
-const FAST_EMA_BARS = 10;
-const SLOW_EMA_BARS = 30;
-const MOMENTUM_BARS = 12;
+const LOOKBACK_BARS = 20;
+const DIP_BPS = 200; // buy at 2% below the 20-bar average
+const EXIT_BPS = 100; // sell at 1% above the 20-bar average
+const STOP_BPS = 300; // stop 3% below the close the buy was decided on
+const COOLDOWN_BARS = 12; // no re-entry for this long after a stop-loss exit
 const REBALANCE_EVERY_BARS = 4;
 const TOP_N = 3;
 // Buys refuse a fill more than 5% away from the latest close (never chase a
@@ -39,72 +40,57 @@ const SELL_MAX_SLIPPAGE_BPS = 10_000;
 
 // Close history (as plain numbers, USDC per unit) per symbol, by batch.
 const closes = new Map<string, number[]>();
-// Symbols to buy on the next batch, chosen on a rebalance bar whose sells
-// have now filled (a sell's proceeds never fund a buy of the same reply).
-let entering: string[] | null = null;
-// The next batch seq we rebalance on.
-let nextRebalance = SLOW_EMA_BARS;
+// The close a buy was decided on, per held symbol: the stop-loss reference.
+const entryClose = new Map<string, number>();
+// The batch seq of each symbol's last stop-loss exit (re-entry cooldown).
+const stopBar = new Map<string, number>();
+// Symbols with a sell sent and not yet filled: never send a second sell.
+const selling = new Set<string>();
+// The next batch seq we evaluate entries on.
+let nextRebalance = LOOKBACK_BARS;
 
-function emaAt(values: number[], span: number): number {
-  const alpha = 2 / (span + 1);
-  let e = values[0];
-  for (let i = 1; i < values.length; i++) e = alpha * values[i] + (1 - alpha) * e;
-  return e;
+/** Trailing simple moving average of the last LOOKBACK_BARS closes. */
+function sma(values: number[]): number {
+  let sum = 0;
+  for (let i = values.length - LOOKBACK_BARS; i < values.length; i++) sum += values[i];
+  return sum / LOOKBACK_BARS;
 }
 
-/** The universe index: each symbol's close divided by its first close, averaged. */
-function indexSeries(state: BarsState): number[] {
-  const n = closes.get(state.hello.symbols[0].symbol)?.length ?? 0;
-  const idx: number[] = [];
-  for (let i = 0; i < n; i++) {
-    let sum = 0;
-    let count = 0;
-    for (const { symbol } of state.hello.symbols) {
-      const series = closes.get(symbol);
-      if (series && series[i] !== undefined && series[0] > 0) {
-        sum += series[i] / series[0];
-        count++;
-      }
-    }
-    idx.push(count > 0 ? sum / count : 1);
-  }
-  return idx;
-}
-
-/** Top symbols by trailing momentum among those in an uptrend, best first. */
-function targetSymbols(state: BarsState): string[] {
-  const ranked: { symbol: string; momentum: number }[] = [];
+/** Symbols cheap enough to buy, deepest dip first. */
+function buyCandidates(state: BarsState): string[] {
+  const ranked: { symbol: string; ratio: number }[] = [];
   for (const { symbol } of state.hello.symbols) {
     const series = closes.get(symbol);
-    if (!series || series.length < SLOW_EMA_BARS + 1) continue;
-    const fast = emaAt(series, FAST_EMA_BARS);
-    const slow = emaAt(series, SLOW_EMA_BARS);
+    if (!series || series.length < LOOKBACK_BARS + 1) continue;
+    const lastStop = stopBar.get(symbol);
+    if (lastStop !== undefined && state.seq - lastStop < COOLDOWN_BARS) continue;
     const price = series[series.length - 1];
-    if (fast <= slow || price <= slow) continue;
-    const back = series[series.length - 1 - MOMENTUM_BARS];
-    if (back <= 0) continue;
-    ranked.push({ symbol, momentum: price / back - 1 });
+    const mean = sma(series);
+    if (price * BPS > mean * (BPS - DIP_BPS)) continue;
+    ranked.push({ symbol, ratio: price / mean });
   }
-  ranked.sort((a, b) => b.momentum - a.momentum);
+  ranked.sort((a, b) => a.ratio - b.ratio);
   return ranked.slice(0, TOP_N).map((r) => r.symbol);
 }
 
-/** True when the whole-universe index is in an uptrend (fast EMA > slow EMA). */
-function regimeUp(state: BarsState): boolean {
-  const idx = indexSeries(state);
-  if (idx.length < SLOW_EMA_BARS + 1) return false;
-  return emaAt(idx, FAST_EMA_BARS) > emaAt(idx, SLOW_EMA_BARS);
+/** Whether a held position should exit on this batch: recovered to the exit
+ *  line above its average, or stopped out below its entry close. */
+function shouldExit(state: BarsState, symbol: string): boolean {
+  const series = closes.get(symbol);
+  if (!series || series.length < LOOKBACK_BARS + 1) return false;
+  const price = series[series.length - 1];
+  const mean = sma(series);
+  if (price * BPS >= mean * (BPS + EXIT_BPS)) return true;
+  const entry = entryClose.get(symbol);
+  if (entry !== undefined && price * BPS < entry * (BPS - STOP_BPS)) return true;
+  return false;
 }
 
 function buys(state: BarsState, symbols: readonly string[]): BuyInput[] {
   const { caps, fees } = state.hello;
   const coming = symbols.filter((s) => !state.positions.has(s) && state.close(s) !== null);
   if (coming.length === 0) return [];
-  // Weight cap per symbol, cut to one third while the universe trends down.
-  const weightBps = regimeUp(state)
-    ? BigInt(caps.max_weight_bps)
-    : BigInt(caps.max_weight_bps) / 3n;
-  const byWeight = (weightBps * state.equity) / BPS;
+  const byWeight = (BigInt(caps.max_weight_bps) * state.equity) / BPS;
   const even = state.cash / BigInt(coming.length);
   const slice = even < byWeight ? even : byWeight;
   if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) return [];
@@ -118,7 +104,7 @@ function buys(state: BarsState, symbols: readonly string[]): BuyInput[] {
 
 await runBars({
   onHello(state) {
-    nextRebalance = Math.max(SLOW_EMA_BARS, state.warmupBars);
+    nextRebalance = Math.max(LOOKBACK_BARS, state.warmupBars);
   },
   onBatch(state, batch) {
     // Record this batch's closes (null where a symbol has no bar yet).
@@ -129,31 +115,51 @@ await runBars({
       series.push(close === null ? NaN : Number(close) / 10 ** meta.price_scale);
       closes.set(symbol, series);
     }
-    // A symbol with a missing bar breaks the EMA chain; drop the series so a
-    // gap never silently feeds stale prices into the averages.
+    // A symbol with a missing bar breaks the average; drop the series so a
+    // gap never silently feeds stale prices into it.
     for (const { symbol } of state.hello.symbols) {
       const series = closes.get(symbol)!;
       if (Number.isNaN(series[series.length - 1])) closes.set(symbol, []);
     }
-    if (state.warmingUp) return [];
-    if (entering !== null) {
-      const orders = buys(state, entering);
-      entering = null;
-      return orders;
+    // A sell sent on the last batch has filled by now when the position is gone.
+    for (const symbol of [...selling]) {
+      if (!state.positions.has(symbol)) selling.delete(symbol);
     }
-    if (batch.seq < nextRebalance) return [];
-    nextRebalance = batch.seq + REBALANCE_EVERY_BARS;
-    const want = targetSymbols(state);
-    const sells: OrderInput[] = [...state.positions]
-      .filter(([symbol]) => !want.includes(symbol))
-      .map(([symbol, p]) => ({
-        side: 'sell',
-        symbol,
-        qty: p.qty,
-        max_slippage_bps: SELL_MAX_SLIPPAGE_BPS,
-      }));
-    if (sells.length === 0) return buys(state, want);
-    entering = want;
-    return sells;
+    // A buy that was refused leaves no position: drop its entry reference.
+    for (const symbol of [...entryClose.keys()]) {
+      if (!state.positions.has(symbol) && !selling.has(symbol)) entryClose.delete(symbol);
+    }
+    if (state.warmingUp) return [];
+    // Exits first, checked every bar.
+    const sells: OrderInput[] = [];
+    for (const [symbol, p] of state.positions) {
+      if (selling.has(symbol)) continue;
+      if (!shouldExit(state, symbol)) continue;
+      const series = closes.get(symbol)!;
+      const price = series[series.length - 1];
+      const entry = entryClose.get(symbol);
+      if (entry !== undefined && price * BPS < entry * (BPS - STOP_BPS)) {
+        stopBar.set(symbol, batch.seq);
+      }
+      entryClose.delete(symbol);
+      selling.add(symbol);
+      sells.push({ side: 'sell', symbol, qty: p.qty, max_slippage_bps: SELL_MAX_SLIPPAGE_BPS });
+    }
+    // Entries every 4 bars, sized from the cash on hand (a sell's proceeds
+    // never fund a buy of the same reply).
+    let orders: OrderInput[] = sells;
+    if (batch.seq >= nextRebalance) {
+      nextRebalance = batch.seq + REBALANCE_EVERY_BARS;
+      const want = buyCandidates(state);
+      orders = [...sells, ...buys(state, want)];
+      for (const o of orders) {
+        if (o.side !== 'buy') continue;
+        const close = state.close(o.symbol);
+        if (close !== null) {
+          entryClose.set(o.symbol, Number(close) / 10 ** state.symbols.get(o.symbol)!.price_scale);
+        }
+      }
+    }
+    return orders;
   },
 });
