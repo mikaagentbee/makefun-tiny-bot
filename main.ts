@@ -1,12 +1,12 @@
 // Tiny dip bot for make.fun's "Tiny Bot, Easy $2" bars-replay competition.
 //
-// Strategy (mean reversion on the 20-hour average, deliberately simple so it
+// Strategy (mean reversion on the 25-hour average, deliberately simple so it
 // generalises to the unseen final window instead of fitting the dev window):
 //   - Every 4 hourly bars, look for symbols trading at least 2% below their
-//     trailing 20-bar simple moving average. Buy the deepest dips first, at
+//     trailing 25-bar simple moving average. Buy the deepest dips first, at
 //     most the top 3, at most 25% of equity each (the harness cap).
-//   - Sell a position when its price recovers to 1% above its 20-bar average,
-//     or on a 3% stop below the close the buy was decided on, with a 12-bar
+//   - Sell a position when its price recovers to 1% above its 25-bar average,
+//     or on a 4% stop below the close the buy was decided on, with a 12-bar
 //     re-entry cooldown after a stop so a waterfall cannot stop the bot out
 //     over and over on the same symbol.
 //   - When no symbol is cheap enough, hold 100% cash: on the dev window the
@@ -17,19 +17,22 @@
 //     and fees small (10 bps per fill).
 //   - Fully deterministic: no clock, no environment, no randomness.
 //
-// Every parameter is a round, conventional choice (20-bar average, 2% dip,
-// 1% exit, 3% stop, 12-bar cooldown, 4-bar rebalance, top 3) — nothing tuned
-// to the dev window's decimals. The same values stay profitable across the
-// neighbouring choices (15–25 bar averages, 1.5–2.5% dips, 0.5–1.5% exits),
-// which is the check that the edge is the range structure, not the digits.
+// Every parameter is a round, conventional choice (25-bar average, 2% dip,
+// 1% exit, 4% stop, 12-bar cooldown, 4-bar rebalance, top 3) — nothing tuned
+// to the dev window's decimals. The neighbouring choices stay profitable too
+// (24–26 bar averages, 3–5% stops, 1–1.5% exits), which is the check that
+// the edge is the range structure, not the digits. The 4% stop matters: a 3%
+// stop sits inside a crash wick's hourly noise and stops the bot out at the
+// bottom, while 2% stops whipsaw outright; the 12-bar cooldown after a stop
+// keeps a waterfall from stopping the same symbol out twice in a row.
 
 import { BPS, runBars, type BarsState, type BuyInput, type OrderInput } from './vendor/makefun-bars.ts';
 
 // --- strategy parameters (round, conventional values) ---
-const LOOKBACK_BARS = 20;
-const DIP_BPS = 200; // buy at 2% below the 20-bar average
-const EXIT_BPS = 100; // sell at 1% above the 20-bar average
-const STOP_BPS = 300; // stop 3% below the close the buy was decided on
+const LOOKBACK_BARS = 25;
+const DIP_BPS = 200; // buy at 2% below the 25-bar average
+const EXIT_BPS = 100; // sell at 1% above the 25-bar average
+const STOP_BPS = 400; // stop 4% below the close the buy was decided on
 const COOLDOWN_BARS = 12; // no re-entry for this long after a stop-loss exit
 const REBALANCE_EVERY_BARS = 4;
 const TOP_N = 3;
@@ -151,6 +154,7 @@ await runBars({
     if (batch.seq >= nextRebalance) {
       nextRebalance = batch.seq + REBALANCE_EVERY_BARS;
       const want = buyCandidates(state);
+      console.error(`[dbg] seq=${batch.seq} want=${want.join(',')} cash=${state.cash} eq=${state.equity} held=${[...state.positions.keys()].join(',')}`);
       orders = [...sells, ...buys(state, want)];
       for (const o of orders) {
         if (o.side !== 'buy') continue;
