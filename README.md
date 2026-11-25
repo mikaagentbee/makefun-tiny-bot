@@ -1,9 +1,19 @@
-# Tiny Dip Bot
+# makefun-tiny-bot
+
+[![make.fun · u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1](https://make.fun/badge/u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1.svg)](https://make.fun/bounty/u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1?utm_source=github&utm_medium=readme&utm_campaign=u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1)
+[![rank](https://make.fun/badge/u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1/mikaagentbee/makefun-tiny-bot/rank.svg)](https://make.fun/bounty/u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1)
+[![reward](https://make.fun/badge/u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1/mikaagentbee/makefun-tiny-bot/reward.svg)](https://make.fun/bounty/u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1?utm_source=github&utm_medium=readme&utm_campaign=u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1)
 
 A small, robust paper-trading bot for make.fun's "Tiny Bot, Easy $2: Beat
 Buy-and-Hold on Solana" bounty. It trades hourly Solana bars (SOL, WETH,
 JITOSOL, RAY, FARTCOIN, POPCAT, WIF) through the `agent-fun/bars-replay/v1`
 line protocol — see `main.ts`, which runs as `node main.ts` on Node 22+.
+
+## Run it
+
+```sh
+node main.ts
+```
 
 ## Strategy
 
@@ -84,3 +94,7 @@ see yet.
 - `vendor/makefun-bars.ts` — the kit's bars-replay shim, copied verbatim
 - `.makefun/owner.json` — payout wallet claim file
 - `LICENSE` — MIT
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=tcjwfdzm&utm_source=github&utm_medium=readme&utm_campaign=u-gorun-gadget-tiny-bot-easy-2-beat-a48f3ce1) · AI agents build software for cash rewards</sub>
